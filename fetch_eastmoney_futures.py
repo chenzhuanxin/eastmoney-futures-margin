@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-东方财富期货 - 交易规则与保证金数据抓取脚本（Excel + HTML 双输出）
+东方财富期货 - 交易规则、保证金与手续费数据抓取脚本（Excel + HTML 双输出）
 
-抓取三个数据源：
+抓取五个数据源：
   1. 保证金比例表     https://www.eastmoneyfutures.com/pages/service/jyts.html#jyrl
                      （静态HTML表格）
   2. 品种及交易规则表 https://www.eastmoneyfutures.com/pages/service/jygz.html
                      （后端API JSON，接口 /emfApi/pzjy/getPZJYInfo）
   3. 品种单手保证金一览表 https://qhweb.eastmoney.com/bzj/low
                      （静态HTML表格）
+  4. 期货手续费标准   https://www.eastmoneyfutures.com/pages/service/sxf.html
+                     （静态HTML表格，公司期货手续费标准）
+  5. 期权手续费标准   https://www.eastmoneyfutures.com/pages/service/qqsxf.html
+                     （静态HTML表格，与期货手续费同属“公司手续费标准”栏目）
 
 输出（当前文件夹）：
   - 东方财富期货交易规则保证金<YYYY-MM-DD>.xlsx
-    工作表：保证金比例 / 交易规则 / 保证金
+    工作表：保证金比例 / 交易规则 / 保证金 / 期货手续费 / 期权手续费
   - 东方财富期货交易规则保证金<YYYY-MM-DD>.html
-    三表切换 + 搜索的美化网页版
+    五表切换 + 搜索的美化网页版
 
 Excel 样式：仿宋 13 号、行高 55 磅、冻结首行、单元格自动换行。
 
@@ -39,6 +43,8 @@ from openpyxl.utils import get_column_letter
 URL_MARGIN_RATIO = "https://www.eastmoneyfutures.com/pages/service/jyts.html#jyrl"
 URL_TRADE_RULES = "https://www.eastmoneyfutures.com/emfApi/pzjy/getPZJYInfo"  # jygz.html 页面实际调用的接口
 URL_MARGIN_LIST = "https://qhweb.eastmoney.com/bzj/low"
+URL_FEE_FUTURES = "https://www.eastmoneyfutures.com/pages/service/sxf.html"    # 期货手续费
+URL_FEE_OPTIONS = "https://www.eastmoneyfutures.com/pages/service/qqsxf.html"   # 期权手续费
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -215,6 +221,114 @@ def parse_margin_list(html):
 
 
 # ---------------------------------------------------------------------------
+# 4/5. 公司手续费标准（sxf.html 期货手续费 / qqsxf.html 期权手续费）
+# ---------------------------------------------------------------------------
+def clean_fee_text(text):
+    """规整手续费文本：压缩空白、半角括号与逗号统一为全角。"""
+    t = re.sub(r"\s+", "", text or "")
+    return t.replace("(", "（").replace(")", "）").replace(",", "，")
+
+
+def fee_mode(text):
+    """按文本推断计费方式：按手收取 / 按成交额 / 其他。"""
+    if "元/手" in text:
+        return "按手收取"
+    if "万分之" in text:
+        return "按成交额"
+    return "其他"
+
+
+def fee_extra(text):
+    """平今仓 / 日内交易 加收标记。"""
+    marks = []
+    if "平今" in text:
+        marks.append("平今加收")
+    if "日内" in text:
+        marks.append("日内加收")
+    return "、".join(marks)
+
+
+def parse_fee(html, label="手续费"):
+    """
+    解析手续费页面（sxf.html / qqsxf.html），两页结构一致。
+
+    结构：
+      <div class="static-page-content"><table>
+        <tr><th>交易所</th><th>品种</th><th>东方财富…手续费标准</th></tr>
+        <tr><td rowspan="20">上海期货交易所</td>
+            <td><pre>白银<span class="right">ag</span></pre></td>
+            <td>万分之1.5(按成交额)</td></tr>
+        <tr><td><pre>铝<span class="right">al</span></pre></td><td>9元/手</td></tr>
+        ...
+      组内首行因 rowspan 带交易所单元格共 3 列，其余行 2 列。
+      品种单元格为 <pre>品种名<span class="right">代码</span></pre>，需拆成两列。
+
+    返回 (rows, update_time, notes)
+      rows: [交易所, 品种, 代码, 手续费标准]
+      update_time: “数据更新日期：YYYY-MM-DD”
+      notes: 页面底部“说明”条目列表
+    """
+    soup = BeautifulSoup(html, "lxml")
+    content = soup.select_one("div.static-page-content")
+    if content is None:
+        raise RuntimeError(f"未在{label}页面中找到 div.static-page-content，页面结构可能已变更")
+    table = content.find("table")
+    if table is None:
+        raise RuntimeError(f"未在{label}页面中找到手续费表格")
+
+    rows = []
+    cur_exchange = ""
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) == 3:
+            cur_exchange = tds[0].get_text(strip=True)
+            cells = tds[1:]
+        elif len(tds) == 2:
+            cells = tds
+        else:
+            continue
+        pre = cells[0].find("pre")
+        if pre is None:
+            continue
+        # 代码在 <span class="right"> 中，先取出再摘掉
+        code_el = pre.find("span")
+        code = code_el.get_text(strip=True) if code_el else ""
+        if code_el is not None:
+            code_el.extract()
+        name = pre.get_text(strip=True)
+        fee = clean_fee_text(cells[1].get_text(" ", strip=True))
+        if not name:
+            continue
+        rows.append([cur_exchange, name, code, fee])
+
+    # 数据更新日期
+    update_time = ""
+    for p in soup.find_all("p"):
+        t = p.get_text(strip=True)
+        if "数据更新日期" in t:
+            update_time = t
+            break
+
+    # 底部说明条目
+    notes = []
+    editor = soup.select_one("div.ql-editor")
+    if editor is not None:
+        for p in editor.find_all("p"):
+            t = re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()
+            if not t:
+                continue
+            t = re.sub(r"^(\d+)\s*、\s*", r"\1、", t)
+            notes.append(t)
+
+    return rows, update_time, notes
+
+
+def with_fee_columns(rows):
+    """在 [交易所,品种,代码,手续费标准] 基础上补出 计费方式 / 平今·日内加收 两列。"""
+    return [[ex, name, code, fee, fee_mode(fee), fee_extra(fee)] for ex, name, code, fee in rows]
+
+
+# ---------------------------------------------------------------------------
 # Excel 写入（样式：仿宋13号 / 行高55磅 / 冻结首行 / 自动换行）
 # ---------------------------------------------------------------------------
 THIN = Side(style="thin", color="BFBFBF")
@@ -275,10 +389,11 @@ def write_sheet(ws, headers, rows, number_formats=None, extra_rows=None, row_hei
 
 
 # ---------------------------------------------------------------------------
-# HTML 生成（三表切换 + 搜索的美化网页版）
+# HTML 生成（五表切换 + 搜索的美化网页版）
 # ---------------------------------------------------------------------------
-def build_html(ratio_rows, rule_rows, margin_rows, update_time, note, fetch_time):
-    """把三个表的数据内嵌为静态 HTML（数据为抓取快照，双击即可打开）。"""
+def build_html(ratio_rows, rule_rows, margin_rows, fee_fut_rows, fee_opt_rows,
+               update_time, note, fetch_time, fee_fut_update, fee_opt_update, fee_notes):
+    """把五个表的数据内嵌为静态 HTML（数据为抓取快照，双击即可打开）。"""
     # 保证金表数据转成便于 JS 展示的数值
     margin_data = []
     for row in margin_rows:
@@ -296,6 +411,15 @@ def build_html(ratio_rows, rule_rows, margin_rows, update_time, note, fetch_time
         "rules": {"headers": ["交易所", "交易品种", "最小变动价位", "交割月份",
                               "最后交易日", "最后交割日期", "交易单位"], "rows": rule_rows},
         "margin": {"headers": ["品种", "合约代码", "保证金(元)", "保证金率", "备注"], "rows": margin_data},
+        "feeFutures": {
+            "headers": ["交易所", "品种", "代码", "东方财富期货手续费标准", "计费方式", "平今/日内加收"],
+            "rows": fee_fut_rows, "updateInfo": fee_fut_update,
+        },
+        "feeOptions": {
+            "headers": ["交易所", "品种", "代码", "东方财富期权手续费标准", "计费方式"],
+            "rows": fee_opt_rows, "updateInfo": fee_opt_update,
+        },
+        "feeNotes": fee_notes,
     })
 
     html = HTML_TEMPLATE.replace("__PAYLOAD__", payload)
@@ -361,7 +485,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     margin: 26px 0 18px; display: flex; align-items: center; justify-content: space-between;
     gap: 14px; flex-wrap: wrap;
   }
-  .tabs { display: flex; gap: 8px; }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
   .tab {
     font-family: inherit; font-size: 15px; cursor: pointer;
     padding: 9px 22px; border: 1px solid var(--line); border-radius: 999px;
@@ -434,6 +558,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: #fff8e6; border: 1px solid #f0e0b0; border-left: 4px solid var(--gold);
     padding: 12px 16px; border-radius: 8px; margin-bottom: 12px;
   }
+  footer .note:empty { display: none; }
+  footer .fee-note { background: #eef4fb; border-color: #cfe0f2; border-left-color: var(--blue); }
+  footer .fee-note p { margin: 3px 0; }
+  footer .fee-note p:first-child { font-weight: 600; color: var(--navy2); }
   footer .sources a { color: var(--blue); text-decoration: none; }
   footer .sources a:hover { text-decoration: underline; }
   footer .risk { color: #8a93a5; }
@@ -442,8 +570,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     header .head-row { flex-direction: column; align-items: flex-start; }
     .search-box input { width: 100%; }
     .controls { align-items: stretch; }
-    .tabs { width: 100%; justify-content: space-between; }
-    .tab { flex: 1; text-align: center; padding: 8px 6px; font-size: 13.5px; }
+    .tabs { width: 100%; flex-wrap: wrap; }
+    .tab { flex: 0 0 auto; padding: 8px 13px; font-size: 13.5px; }
   }
 </style>
 </head>
@@ -455,7 +583,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="logo">东</div>
         <div>
           <h1>东方财富期货 · 交易规则与保证金一览</h1>
-          <p>保证金比例表 · 品种及交易规则表 · 品种单手保证金一览表</p>
+          <p>保证金比例表 · 品种及交易规则表 · 品种单手保证金一览表 · 期货手续费 · 期权手续费</p>
         </div>
       </div>
       <div class="badges">
@@ -472,6 +600,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="tab active" data-tab="ratio">保证金比例</button>
       <button class="tab" data-tab="rules">交易规则</button>
       <button class="tab" data-tab="margin">单手保证金</button>
+      <button class="tab" data-tab="feeFutures">期货手续费</button>
+      <button class="tab" data-tab="feeOptions">期权手续费</button>
     </div>
     <div class="search-box">
       <span class="icon">&#128269;</span>
@@ -482,16 +612,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="panel active" id="panel-ratio"></div>
   <div class="panel" id="panel-rules"></div>
   <div class="panel" id="panel-margin"></div>
+  <div class="panel" id="panel-feeFutures"></div>
+  <div class="panel" id="panel-feeOptions"></div>
 
   <footer>
     <div class="note" id="noteText"></div>
+    <div class="note fee-note" id="feeNotes"></div>
     <div class="sources">
       数据来源：
       <a href="https://www.eastmoneyfutures.com/pages/service/jyts.html#jyrl" target="_blank" rel="noopener">东方财富期货·保证金率</a> ·
       <a href="https://www.eastmoneyfutures.com/pages/service/jygz.html" target="_blank" rel="noopener">东方财富期货·品种及交易规则</a> ·
-      <a href="https://qhweb.eastmoney.com/bzj/low" target="_blank" rel="noopener">东方财富期货·品种单手保证金一览表</a>
+      <a href="https://qhweb.eastmoney.com/bzj/low" target="_blank" rel="noopener">东方财富期货·品种单手保证金一览表</a> ·
+      <a href="https://www.eastmoneyfutures.com/pages/service/sxf.html" target="_blank" rel="noopener">东方财富期货·期货手续费</a> ·
+      <a href="https://www.eastmoneyfutures.com/pages/service/qqsxf.html" target="_blank" rel="noopener">东方财富期货·期权手续费</a>
     </div>
-    <div class="risk" style="margin-top:6px">免责声明：本页面数据仅供信息参考，不构成任何投资建议或承诺。保证金会随行情波动，交易所与期货公司也可能进行调整，具体以东方财富期货APP交易界面“保证金率”为准。</div>
+    <div class="risk" style="margin-top:6px">免责声明：本页面数据仅供信息参考，不构成任何投资建议或承诺。保证金与手续费会随行情及交易所、期货公司政策调整，实际以中国期货市场监控中心交易结算单及东方财富期货APP交易界面为准。</div>
   </footer>
 </div>
 
@@ -501,10 +636,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   document.getElementById('fetchTime').textContent = DATA.fetchTime;
   document.getElementById('updateTime').textContent = DATA.updateTime;
-  document.getElementById('noteText').textContent = DATA.updateTime + '；' + (DATA.ratio.rows.length + DATA.rules.rows.length + DATA.margin.rows.length) + ' 个品种数据条目，抓取自东方财富期货官网。';
 
-  var panels = { ratio: 'panel-ratio', rules: 'panel-rules', margin: 'panel-margin' };
-  var titles = { ratio: '保证金比例表', rules: '品种及交易规则表', margin: '品种单手保证金一览表' };
+  var total = DATA.ratio.rows.length + DATA.rules.rows.length + DATA.margin.rows.length +
+              DATA.feeFutures.rows.length + DATA.feeOptions.rows.length;
+  document.getElementById('noteText').textContent =
+    DATA.updateTime + '；共 ' + total + ' 条数据，抓取自东方财富期货官网。';
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // 手续费页面底部说明
+  if (DATA.feeNotes && DATA.feeNotes.length) {
+    document.getElementById('feeNotes').innerHTML =
+      DATA.feeNotes.map(function (n) { return '<p>' + esc(n) + '</p>'; }).join('');
+  }
+
+  var panels = {
+    ratio: 'panel-ratio', rules: 'panel-rules', margin: 'panel-margin',
+    feeFutures: 'panel-feeFutures', feeOptions: 'panel-feeOptions'
+  };
+  var titles = {
+    ratio: '保证金比例表', rules: '品种及交易规则表', margin: '品种单手保证金一览表',
+    feeFutures: '公司期货手续费标准（不高于以下标准）',
+    feeOptions: '公司期权手续费标准（不高于以下标准）'
+  };
+  var isFee = { feeFutures: 1, feeOptions: 1 };
   var current = 'ratio';
   var keyword = '';
 
@@ -520,7 +678,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
     var html = '';
     html += '<div class="card"><div class="card-head"><h2>' + titles[key] + '</h2>' +
-            '<span class="count">共 <b>' + rows.length + '</b> 条' +
+            '<span class="count">' + (conf.updateInfo ? esc(conf.updateInfo) + ' · ' : '') +
+            '共 <b>' + rows.length + '</b> 条' +
             (keyword ? '（筛选自 ' + conf.rows.length + ' 条）' : '') + '</span></div>' +
             '<div class="table-scroll"><table><thead><tr>';
     conf.headers.forEach(function (h, i) {
@@ -532,18 +691,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       html += '<tr>';
       row.forEach(function (cell, i) {
         var cls = '';
-        var text = cell;
+        var text = esc(cell);
         if (key === 'margin') {
           if (i === 2) { cls = 'num'; text = fmtMoney(cell); }
           if (i === 3) { cls = 'num'; text = fmtPct(cell); }
           if (i === 4 && cell) {
             var s = String(cell);
             var cls2 = s.indexOf('特殊') > -1 ? 'special' : (s.indexOf('不活跃') > -1 ? 'warn' : '');
-            text = '<span class="tag ' + cls2 + '">' + s + '</span>';
+            text = '<span class="tag ' + cls2 + '">' + esc(s) + '</span>';
           }
         }
         if (key === 'ratio' && i === 5 && typeof cell === 'string' && cell.indexOf('%') > -1 && cell.indexOf('±') === -1) {
-          text = '<span class="tag">' + cell + '</span>';
+          text = '<span class="tag">' + esc(cell) + '</span>';
+        }
+        if (isFee[key]) {
+          if (i === 4) {
+            text = '<span class="tag' + (String(cell) === '按成交额' ? ' special' : '') + '">' + esc(cell) + '</span>';
+          }
+          if (i === 5 && cell) {
+            text = '<span class="tag warn">' + esc(cell) + '</span>';
+          }
         }
         html += '<td' + (cls ? ' class="' + cls + '"' : '') + '>' + text + '</td>';
       });
@@ -586,12 +753,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 # 主流程
 # ---------------------------------------------------------------------------
 def main():
-    print(f"[1/3] 抓取保证金比例表: {URL_MARGIN_RATIO}")
+    print(f"[1/5] 抓取保证金比例表: {URL_MARGIN_RATIO}")
     html1 = fetch(URL_MARGIN_RATIO, referer="https://www.eastmoneyfutures.com/pages/service/index.html")
     ratio_rows = parse_margin_ratio(html1)
     print(f"      解析到 {len(ratio_rows)} 行")
 
-    print(f"[2/3] 抓取品种及交易规则表: {URL_TRADE_RULES}")
+    print(f"[2/5] 抓取品种及交易规则表: {URL_TRADE_RULES}")
     raw2 = fetch(URL_TRADE_RULES, referer="https://www.eastmoneyfutures.com/pages/service/jygz.html",
                  encoding="utf-8")
     try:
@@ -601,10 +768,25 @@ def main():
     rule_rows = parse_trade_rules(api_json)
     print(f"      解析到 {len(rule_rows)} 行")
 
-    print(f"[3/3] 抓取品种单手保证金一览表: {URL_MARGIN_LIST}")
+    print(f"[3/5] 抓取品种单手保证金一览表: {URL_MARGIN_LIST}")
     html3 = fetch(URL_MARGIN_LIST, referer="https://qhweb.eastmoney.com/bzj/low")
     margin_rows, update_time, note = parse_margin_list(html3)
     print(f"      解析到 {len(margin_rows)} 行, 更新时间: {update_time}")
+
+    print(f"[4/5] 抓取期货手续费标准: {URL_FEE_FUTURES}")
+    html4 = fetch(URL_FEE_FUTURES, referer="https://www.eastmoneyfutures.com/pages/service/index.html")
+    fee_fut_raw, fee_fut_update, fee_notes = parse_fee(html4, label="期货手续费")
+    fee_fut_rows = with_fee_columns(fee_fut_raw)
+    print(f"      解析到 {len(fee_fut_rows)} 行, {fee_fut_update}")
+
+    print(f"[5/5] 抓取期权手续费标准: {URL_FEE_OPTIONS}")
+    html5 = fetch(URL_FEE_OPTIONS, referer="https://www.eastmoneyfutures.com/pages/service/sxf.html")
+    fee_opt_raw, fee_opt_update, opt_notes = parse_fee(html5, label="期权手续费")
+    # 期权无平今加收概念，只保留前 5 列
+    fee_opt_rows = [r[:5] for r in with_fee_columns(fee_opt_raw)]
+    if not fee_notes:
+        fee_notes = opt_notes
+    print(f"      解析到 {len(fee_opt_rows)} 行, {fee_opt_update}")
 
     fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -637,15 +819,32 @@ def main():
         extra_rows=[note] if note else None,
     )
 
+    ws4 = wb.create_sheet("期货手续费")
+    write_sheet(
+        ws4,
+        ["交易所", "品种", "代码", "东方财富期货手续费标准", "计费方式", "平今/日内加收"],
+        fee_fut_rows,
+        extra_rows=(([fee_fut_update] if fee_fut_update else []) + fee_notes) or None,
+    )
+
+    ws5 = wb.create_sheet("期权手续费")
+    write_sheet(
+        ws5,
+        ["交易所", "品种", "代码", "东方财富期权手续费标准", "计费方式"],
+        fee_opt_rows,
+        extra_rows=([fee_opt_update] if fee_opt_update else []) or None,
+    )
+
     wb.save(OUT_XLSX)
     print(f"\nExcel 已保存: {OUT_XLSX}")
 
-    # ---- HTML（三表切换 + 搜索的美化网页版） ----
-    html = build_html(ratio_rows, rule_rows, margin_rows, update_time, note, fetch_time)
+    # ---- HTML（五表切换 + 搜索的美化网页版） ----
+    html = build_html(ratio_rows, rule_rows, margin_rows, fee_fut_rows, fee_opt_rows,
+                      update_time, note, fetch_time, fee_fut_update, fee_opt_update, fee_notes)
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"HTML 已保存: {OUT_HTML}")
-    print("工作表/页面: 保证金比例 / 交易规则 / 保证金")
+    print("工作表/页面: 保证金比例 / 交易规则 / 保证金 / 期货手续费 / 期权手续费")
 
 
 if __name__ == "__main__":
